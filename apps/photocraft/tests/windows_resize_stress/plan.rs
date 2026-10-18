@@ -231,6 +231,13 @@ pub fn fit_sweep(asked: Sweep, grab: (i32, i32), axes: Axes, screen: (i32, i32))
     Ok(Fitted { sweep, reduced: sweep != asked })
 }
 
+/// Whether the value of `PHOTOCRAFT_RESIZE_STRESS` (`None`: not set) allows the tests that take the real mouse to
+/// run. Only the exact value `1` does: `0`, `false`, `no`, an empty value and anything else leave them off, because
+/// a value that reads as "off" must never switch on something that takes over the mouse.
+pub fn opted_in(value: Option<&std::ffi::OsStr>) -> bool {
+    value.is_some_and(|v| v == "1")
+}
+
 /// The `WxH` size in `text` (as `PHOTOCRAFT_STRESS_SCREEN` gives it), if it is one a window can be placed in.
 pub fn parse_screen(text: &str) -> Option<(i32, i32)> {
     let (w, h) = text.trim().split_once(['x', 'X'])?;
@@ -394,7 +401,8 @@ pub struct Observations {
     pub laid_out_px: Option<(f64, f64)>,
     /// Why a command sent after the run (new document, fill) failed.
     pub edit_error: Option<String>,
-    /// The app's private memory in MB before the run and after it.
+    /// The app's private memory in MB before the run and after it; `None` when either could not be read, which
+    /// [`judge`] reports as a failure (an unchecked limit is not a pass).
     pub memory_mb: Option<(f64, f64)>,
 }
 
@@ -457,10 +465,12 @@ pub fn judge(obs: &Observations, limits: &Limits) -> Vec<String> {
     if let Some(error) = &obs.edit_error {
         problems.push(format!("the app stopped accepting commands after the resize: {error}"));
     }
-    if let Some((before, after)) = obs.memory_mb
-        && after - before > limits.memory_growth_mb
-    {
-        problems.push(format!("private memory grew from {before:.0} MB to {after:.0} MB (limit +{:.0} MB)", limits.memory_growth_mb));
+    match obs.memory_mb {
+        Some((before, after)) if after - before > limits.memory_growth_mb => {
+            problems.push(format!("private memory grew from {before:.0} MB to {after:.0} MB (limit +{:.0} MB)", limits.memory_growth_mb));
+        }
+        Some(_) => {}
+        None => problems.push(format!("private memory could not be measured, so the +{:.0} MB growth limit was not checked", limits.memory_growth_mb)),
     }
     problems
 }
@@ -850,6 +860,17 @@ mod tests {
     }
 
     #[test]
+    fn only_the_exact_value_1_allows_the_tests_that_take_the_mouse() {
+        use std::ffi::OsStr;
+        assert!(opted_in(Some(OsStr::new("1"))));
+        // Anything else is off, however much it reads like "on" or like "off".
+        for value in ["0", "false", "False", "FALSE", "true", "TRUE", "yes", "on", "y", "2", "01", "11", "1 ", " 1", " ", ""] {
+            assert!(!opted_in(Some(OsStr::new(value))), "{value:?} must not allow them");
+        }
+        assert!(!opted_in(None), "unset must not allow them");
+    }
+
+    #[test]
     fn a_display_size_is_wxh() {
         assert_eq!(parse_screen("1366x768"), Some((1366, 768)));
         assert_eq!(parse_screen(" 1280 X 800 "), Some((1280, 800)));
@@ -872,6 +893,41 @@ mod tests {
         // No frame at all is reported, not skipped.
         let none = Observations { surface_px: None, ..healthy() };
         assert!(judge(&none, &Limits::default()).iter().any(|p| p.contains("no frame was rendered")));
+    }
+
+    #[test]
+    fn a_run_whose_memory_could_not_be_measured_fails_instead_of_passing() {
+        // `win::private_mb` can fail (the process is gone, or the OS will not say), and a limit that was not
+        // checked is not a pass.
+        let unmeasured = Observations { memory_mb: None, ..healthy() };
+        let problems = judge(&unmeasured, &Limits::default());
+        assert_eq!(problems.len(), 1, "{problems:?}");
+        assert!(problems[0].contains("could not be measured") && problems[0].contains("+200 MB"), "{problems:?}");
+        // Whatever the limit, and next to other problems, it is still reported.
+        let limits = Limits { memory_growth_mb: 50.0, ..Limits::default() };
+        assert!(judge(&unmeasured, &limits).iter().any(|p| p.contains("could not be measured") && p.contains("+50 MB")));
+        let and_dead = Observations { memory_mb: None, died: Some("exit code: 1".into()), ..healthy() };
+        assert_eq!(judge(&and_dead, &Limits::default()).len(), 2);
+    }
+
+    #[test]
+    fn memory_growth_is_judged_against_the_configured_limit() {
+        let judged = |growth: f64, limit: f64| {
+            let obs = Observations { memory_mb: Some((400.0, 400.0 + growth)), ..healthy() };
+            judge(&obs, &Limits { memory_growth_mb: limit, ..Limits::default() })
+        };
+        // Normal growth, none and shrinking are fine, and growth exactly at the limit is not past it.
+        for growth in [3.0, 0.0, -80.0, 200.0] {
+            assert!(judged(growth, 200.0).is_empty(), "{growth}");
+        }
+        // 1 MB past the limit fails, naming both readings and the limit.
+        let over = judged(201.0, 200.0);
+        assert_eq!(over.len(), 1, "{over:?}");
+        assert!(over[0].contains("grew from 400 MB to 601 MB") && over[0].contains("limit +200 MB"), "{over:?}");
+        // The limit is whatever was configured.
+        assert!(judged(60.0, 50.0).iter().any(|p| p.contains("limit +50 MB")));
+        assert!(judged(40.0, 50.0).is_empty());
+        assert!(judged(500.0, 1000.0).is_empty());
     }
 
     #[test]

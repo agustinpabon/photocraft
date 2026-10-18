@@ -85,13 +85,16 @@ pub struct Session {
     _serial: MutexGuard<'static, ()>,
 }
 
-/// The tests move the real mouse and open a window, so they refuse to run unless asked in so many words,
-/// and run one at a time even when the test harness uses several threads.
+/// The tests move the real mouse and open a window, so they refuse to run unless asked in so many words (the
+/// variable set to exactly `1`: see [`plan::opted_in`]), and run one at a time even when the test harness uses
+/// several threads.
 pub fn begin() -> Session {
-    let opted_in = std::env::var_os(OPT_IN).is_some_and(|v| !v.is_empty() && v != "0");
+    let value = std::env::var_os(OPT_IN);
     assert!(
-        opted_in,
-        "this test takes over the real mouse and opens a PhotoCraft window: set {OPT_IN}=1 to run it (docs/development.md › Windows resize stress test)"
+        plan::opted_in(value.as_deref()),
+        "this test takes over the real mouse and opens a PhotoCraft window: set {OPT_IN}=1 to run it (only the exact value 1 counts, and it is {}) \
+         (docs/development.md › Windows resize stress test)",
+        value.as_deref().map_or_else(|| "not set".to_owned(), |v| format!("{v:?}"))
     );
     static SERIAL: Mutex<()> = Mutex::new(());
     Session { _serial: SERIAL.lock().unwrap_or_else(PoisonError::into_inner) }

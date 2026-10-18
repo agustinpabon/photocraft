@@ -313,11 +313,11 @@ translations do not affect the denominator. Unregistered locale TSV files are ig
 
 - **Alive and answering.** A second thread asks `ui.inspect` four times a second while the window is resized. An answer proves the UI thread ran a frame, so a frozen window shows as a gap in the answers (limit 3 s).
 - **Drawing at the window's size.** Afterwards the size of the frame the app rendered (`ui.screenshot` captures the surface it drew to) and the size it laid its UI out at must match the window's client area. A stale swap chain, the black strip in the #7252 screenshot, fails here.
-- **Recovered.** The app still takes a new document and a fill, and its private memory has not grown by more than 200 MB.
+- **Recovered.** The app still takes a new document and a fill, and its private memory has not grown by more than 200 MB. A run that cannot read the app's memory fails, saying so, instead of skipping that check.
 
 There is one test per scenario: the right border of an empty window (as reported), the left border, a corner with a 6000 × 4000 document, a border swept through the minimum size and back, maximize/restore cycles, a `SetWindowPos` storm (the same `WM_SIZE` handling without the OS's modal loop and without the mouse) and a seeded randomized soak (speeds, borders, corners, quick re-grabs, maximizing). The drags use the real mouse (`SendInput`), and the test checks that the OS entered its modal sizing loop, the path a person's drag takes.
 
-They take over the mouse and open a window, so they are `#[ignore]`d and also need `PHOTOCRAFT_RESIZE_STRESS=1`: CI never runs them, and a `cargo test -- --ignored` over the workspace gets a failure naming the variable instead of a taken mouse. Leave the mouse alone while they run. The test only presses when its window is under the cursor and the cursor is where it put it, so a click can never land on another window, and during a drag it stops (releasing the button) and fails, saying why, if something else moves the mouse.
+They take over the mouse and open a window, so they are `#[ignore]`d and also need `PHOTOCRAFT_RESIZE_STRESS=1`, exactly: `0`, `false`, `true` or an empty value leave them off. CI never runs them, and a `cargo test -- --ignored` over the workspace gets a failure naming the variable instead of a taken mouse. Leave the mouse alone while they run. The test only presses when its window is under the cursor and the cursor is where it put it, so a click can never land on another window, and during a drag it stops (releasing the button) and fails, saying why, if something else moves the mouse.
 
 ```powershell
 $env:PHOTOCRAFT_RESIZE_STRESS = "1"
@@ -332,7 +332,7 @@ On a small display the windows and sweeps are fitted to it, so the OS never pins
 
 | Variable | Default | Effect |
 |---|---|---|
-| `PHOTOCRAFT_RESIZE_STRESS` | unset | `1` lets the tests take the mouse |
+| `PHOTOCRAFT_RESIZE_STRESS` | unset | exactly `1` lets the tests take the mouse; any other value (`0`, `false`, `true`, empty) leaves them off |
 | `PHOTOCRAFT_STRESS_EXE` | the binary cargo built | the `photocraft.exe` to test |
 | `PHOTOCRAFT_STRESS_ARGS` | none | extra arguments, split on spaces |
 | `PHOTOCRAFT_STRESS_SECONDS` | `15` | how long each drag lasts |

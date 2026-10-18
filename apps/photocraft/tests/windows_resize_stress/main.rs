@@ -22,6 +22,38 @@ mod run;
 #[cfg(windows)]
 mod win;
 
+/// The opt-in guard itself, end to end: the tests that take the real mouse refuse to run unless
+/// `PHOTOCRAFT_RESIZE_STRESS` is exactly `1`.
+#[cfg(windows)]
+mod opt_in {
+    use std::process::Command;
+
+    /// Run one of the ignored scenarios in a child of this test binary, with `value` as the opt-in variable (or none
+    /// at all), and return whether it failed and everything it printed. The scenario is the one that does not use the
+    /// mouse, so a guard that let it through would open a window and nothing worse.
+    fn run_scenario_with(value: Option<&str>) -> (bool, String) {
+        let mut child = Command::new(std::env::current_exe().expect("this test binary"));
+        child.args(["--ignored", "--exact", "resize::resize_storm_through_the_window_api", "--test-threads=1", "--nocapture"]);
+        child.env_remove("PHOTOCRAFT_RESIZE_STRESS");
+        if let Some(value) = value {
+            child.env("PHOTOCRAFT_RESIZE_STRESS", value);
+        }
+        let output = child.output().expect("run the child test binary");
+        let text = format!("{}{}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+        (!output.status.success(), text)
+    }
+
+    #[test]
+    fn the_stress_tests_refuse_to_run_unless_the_variable_is_exactly_1() {
+        for value in [None, Some(""), Some("0"), Some("false"), Some("true"), Some("yes")] {
+            let (failed, output) = run_scenario_with(value);
+            assert!(failed, "{value:?} must not turn the stress tests on: {output}");
+            assert!(output.contains("takes over the real mouse"), "{value:?} was not refused with the opt-in message: {output}");
+            assert!(!output.contains("[resize-stress]"), "{value:?} started a run: {output}");
+        }
+    }
+}
+
 #[cfg(windows)]
 mod resize {
     use crate::run::{Scenario, run};
