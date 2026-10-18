@@ -6,6 +6,7 @@
 //! so a PhotoCraft you have open is never touched; its settings live in a throwaway directory under
 //! `target/tmp`.
 
+use std::collections::BTreeSet;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -17,7 +18,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use serde_json::{Value, json};
 
 use crate::control::Control;
-use crate::plan::{self, Axes, Kind, Limits, Observations, Probe, Segment, Sweep};
+use crate::plan::{self, Axes, CursorCheck, Fixed, Kind, Limits, Observations, Probe, Segment, Sweep};
 use crate::win::{self, Window};
 
 const OPT_IN: &str = "PHOTOCRAFT_RESIZE_STRESS";
@@ -31,9 +32,32 @@ struct Config {
     seed: u64,
     limits: Limits,
     out_dir: Option<PathBuf>,
+    /// The primary display's size in px as the plans see it: the real one, or a smaller one (see [`display_size`]).
+    screen: (i32, i32),
+}
+
+/// The primary display's size in px. `PHOTOCRAFT_STRESS_SCREEN=WxH` makes the plans act as if the display were
+/// that size, so the plans for a small display (1366x768, say) can be run on a big one: the windows and sweeps
+/// stay inside that corner of the real display. A size that is malformed, or bigger than the real display, stops
+/// the test with a message: a typo here must not quietly run the full-size plans.
+fn display_size() -> (i32, i32) {
+    let real = win::screen_size();
+    let Some(text) = std::env::var("PHOTOCRAFT_STRESS_SCREEN").ok().map(|v| v.trim().to_owned()).filter(|v| !v.is_empty()) else {
+        return real;
+    };
+    let asked = plan::parse_screen(&text).unwrap_or_else(|| panic!("PHOTOCRAFT_STRESS_SCREEN={text:?} is not a size like 1366x768 (at least 640x480)"));
+    assert!(
+        asked.0 <= real.0 && asked.1 <= real.1,
+        "PHOTOCRAFT_STRESS_SCREEN={text} is bigger than this {}x{} display: it can only pretend to be smaller",
+        real.0,
+        real.1
+    );
+    asked
 }
 
 impl Config {
+    /// Read the `PHOTOCRAFT_STRESS_*` variables. A malformed number falls back to its default, but a malformed or
+    /// too large `PHOTOCRAFT_STRESS_SCREEN` stops the test (see [`display_size`]): it would change what is tested.
     fn from_env() -> Config {
         let text = |name: &str| std::env::var(name).ok().map(|v| v.trim().to_owned()).filter(|v| !v.is_empty());
         let number = |name: &str, default: f64| text(name).and_then(|v| v.parse::<f64>().ok()).filter(|v| v.is_finite() && *v > 0.0).unwrap_or(default);
@@ -51,6 +75,7 @@ impl Config {
                 ..defaults
             },
             out_dir: text("PHOTOCRAFT_STRESS_OUT").map(PathBuf::from),
+            screen: display_size(),
         }
     }
 }
@@ -72,17 +97,22 @@ pub fn begin() -> Session {
     Session { _serial: SERIAL.lock().unwrap_or_else(PoisonError::into_inner) }
 }
 
+/// The app's standard error, collected line by line by a thread that reads its pipe (so the app never blocks on it).
 type Log = Arc<Mutex<Vec<String>>>;
 
+/// Whether any line the app has logged so far contains `needle`.
 fn log_has(log: &Log, needle: &str) -> bool {
     log.lock().unwrap_or_else(PoisonError::into_inner).iter().any(|l| l.contains(needle))
 }
 
+/// The last `n` lines the app logged, for a failure message.
 fn log_tail(log: &Log, n: usize) -> String {
     let lines = log.lock().unwrap_or_else(PoisonError::into_inner);
     lines.iter().skip(lines.len().saturating_sub(n)).cloned().collect::<Vec<_>>().join("\n")
 }
 
+/// A loopback port that was free a moment ago. The app binds it later, so [`App::launch`] tries again with a new
+/// one if something else got there first.
 fn free_port() -> Result<u16, String> {
     std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).and_then(|l| l.local_addr()).map(|a| a.port()).map_err(|e| format!("no free port: {e}"))
 }
@@ -115,9 +145,15 @@ struct App {
     keep_dir: bool,
     /// Presses that did not start a resize and were tried again (see [`App::drag_border`]).
     missed_grabs: u32,
+    /// The display the plans and sweeps are fitted to (see [`Config::screen`]).
+    screen: (i32, i32),
+    /// What the run did differently from what was asked, for the report: sweeps cut down to fit the display.
+    notes: BTreeSet<String>,
 }
 
 impl App {
+    /// Start an isolated PhotoCraft (its own settings folder, control port and token) and wait until its control
+    /// server answers and its main window exists. On failure the error carries the end of the app's log.
     fn launch(cfg: &Config, name: &str) -> Result<App, String> {
         let stamp = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_nanos());
         let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!("resize-stress-{name}-{}-{stamp}", std::process::id()));
@@ -161,7 +197,9 @@ impl App {
                 });
             }
             match wait_until_ready(&mut child, &log, port, &token_file) {
-                Ok((token, window)) => return Ok(App { child, window, port, token, dir, log, keep_dir: false, missed_grabs: 0 }),
+                Ok((token, window)) => {
+                    return Ok(App { child, window, port, token, dir, log, keep_dir: false, missed_grabs: 0, screen: cfg.screen, notes: BTreeSet::new() });
+                }
                 Err(error) => {
                     let _ = child.kill();
                     let _ = child.wait();
@@ -185,6 +223,8 @@ impl App {
         }
     }
 
+    /// A new control connection. The app drops one that sits idle for 30 s, so callers connect when they need one
+    /// instead of keeping one across a drag.
     fn connect(&self, timeout: Duration) -> Result<Control, String> {
         Control::connect(self.port, &self.token, timeout)
     }
@@ -239,9 +279,23 @@ impl App {
             moves += 1;
             if moves.is_multiple_of(25)
                 && let Some(at) = win::cursor()
-                && plan::off_path(at, grab, axes)
             {
-                return Err(DragError::stopped(format!("the cursor left its path (at {at:?}): something else moved the mouse; stopped so as not to fight it")));
+                match plan::check_cursor(at, grab, axes, self.screen) {
+                    CursorCheck::OnPath => {}
+                    // `fit_sweep` keeps the sweep on the display, so this means the plan or the window was not what was
+                    // expected. It is not put down to the user, who may well not have touched the mouse.
+                    CursorCheck::AtScreenEdge => {
+                        return Err(DragError::stopped(format!(
+                            "the OS stopped the cursor at the edge of the {}x{} display, at {at:?}: the sweep ran out of screen (or something moved the mouse there)",
+                            self.screen.0, self.screen.1
+                        )));
+                    }
+                    CursorCheck::Moved => {
+                        return Err(DragError::stopped(format!(
+                            "the cursor left its path (at {at:?}): something else moved the mouse; stopped so as not to fight it"
+                        )));
+                    }
+                }
             }
             next += Duration::from_secs_f64(step_s);
             thread::sleep(next.saturating_duration_since(Instant::now()));
@@ -275,14 +329,19 @@ impl App {
     fn drag_border(&mut self, kind: Kind, sweep: Sweep, seconds: f64, step_s: f64) -> Result<(), String> {
         for attempt in 1..=GRAB_ATTEMPTS {
             self.wait_until_at_rest();
-            let (left, top, right, bottom) = self.window.rect().ok_or("cannot read the window's rectangle")?;
-            let mid = (top + bottom) / 2;
-            let (grab, axes) = match kind {
-                Kind::LeftEdge => ((left + 3, mid), Axes { x: true, y: false }),
-                Kind::Corner => ((right - 4, bottom - 4), Axes { x: true, y: true }),
-                _ => ((right - 4, mid), Axes { x: true, y: false }),
-            };
-            let result = self.drag(grab, axes, sweep, seconds, step_s);
+            let rect = self.window.rect().ok_or("cannot read the window's rectangle")?;
+            let (grab, axes) = plan::grab_point(kind, rect);
+            // Fit the sweep to the room the window's real rectangle leaves on the display (the OS may have made it
+            // bigger than planned), and say so in the report when it had to be cut down. A display with no room
+            // for a meaningful sweep fails the run here, with the numbers, rather than running a token one.
+            let fitted = plan::fit_sweep(sweep, grab, axes, self.screen).map_err(|why| format!("{kind:?} with the window at {rect:?}: {why}"))?;
+            if fitted.reduced {
+                self.notes.insert(format!(
+                    "{kind:?}: the sweep was cut from {} to {} px (period {:.2} to {:.2} s, so the border moves as fast) to fit the {}x{} display",
+                    sweep.amplitude, fitted.sweep.amplitude, sweep.period_s, fitted.sweep.period_s, self.screen.0, self.screen.1
+                ));
+            }
+            let result = self.drag(grab, axes, fitted.sweep, seconds, step_s);
             self.wait_until_at_rest();
             match result {
                 Ok(()) => return Ok(()),
@@ -297,6 +356,7 @@ impl App {
         Ok(())
     }
 
+    /// Maximize and restore the window over and over for `seconds`, pausing a little differently each time.
     fn maximize_restore(&mut self, seconds: f64) {
         let end = Instant::now() + Duration::from_secs_f64(seconds);
         let mut i = 0u64;
@@ -377,6 +437,8 @@ impl App {
 }
 
 impl Drop for App {
+    /// Kill the app and remove its throwaway settings folder, unless the run failed: that folder (with the app's own
+    /// log file) is then kept, and its path is in the failure message.
     fn drop(&mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
@@ -445,6 +507,9 @@ struct Prober {
 }
 
 impl Prober {
+    /// Begin probing in a thread: connect (and reconnect after any error), ask `ui.inspect` every
+    /// [`plan::PROBE_INTERVAL_S`], and record each answer's latency and each failure. `timeout` is how long one
+    /// request may take before it counts as a failure.
     fn start(port: u16, token: String, timeout: Duration) -> Prober {
         let stop = Arc::new(AtomicBool::new(false));
         let flag = Arc::clone(&stop);
@@ -480,6 +545,7 @@ impl Prober {
         Prober { stop, handle }
     }
 
+    /// Stop probing and hand over what was seen.
     fn finish(self) -> ProbeLog {
         self.stop.store(true, Ordering::Relaxed);
         self.handle.join().unwrap_or_default()
@@ -499,6 +565,7 @@ pub enum Scenario {
 }
 
 impl Scenario {
+    /// The name in reports and in the output directory's layout (`PHOTOCRAFT_STRESS_OUT/<name>/`).
     fn name(self) -> &'static str {
         match self {
             Scenario::RightBorder => "right-border",
@@ -520,8 +587,15 @@ impl Scenario {
         }
     }
 
-    fn start_size(self) -> (i32, i32) {
-        if matches!(self, Scenario::BelowMinimum) { (900, 700) } else { (1100, 700) }
+    /// The drag this scenario makes, if it is a fixed one (the others park the window at the default size).
+    fn fixed(self) -> Option<Fixed> {
+        match self {
+            Scenario::RightBorder => Some(Fixed::RightBorder),
+            Scenario::LeftBorder => Some(Fixed::LeftBorder),
+            Scenario::Corner => Some(Fixed::Corner),
+            Scenario::BelowMinimum => Some(Fixed::BelowMinimum),
+            Scenario::MaximizeRestore | Scenario::ApiStorm | Scenario::Soak => None,
+        }
     }
 }
 
@@ -570,7 +644,7 @@ pub fn run(scenario: Scenario) {
 
 /// Run the scenario and collect what to judge, plus details for the report.
 fn drive(app: &mut App, cfg: &Config, scenario: Scenario) -> Result<(Observations, Value), String> {
-    let screen = win::screen_size();
+    let screen = cfg.screen;
     let mut control = app.connect(Duration::from_secs(30))?;
     let gpu = control.call("ui.inspect", json!({}))?.pointer("/perf/timings/gpuInfo").cloned().unwrap_or(Value::Null);
     if let Some((width, height)) = scenario.document() {
@@ -582,8 +656,10 @@ fn drive(app: &mut App, cfg: &Config, scenario: Scenario) -> Result<(Observation
     let _ = app.rendered_size();
     let memory_before = settled_memory_mb(app.child.id());
 
-    let size = scenario.start_size();
-    let park = if matches!(scenario, Scenario::LeftBorder) { ((screen.0 - plan::MARGIN - size.0).max(plan::PARK.0), plan::PARK.1) } else { plan::PARK };
+    // A fixed scenario's window and sweep come from `plan::fixed_plan`, fitted to the display; the others start from
+    // the default size, likewise fitted. (`fit_sweep` then fits each sweep again, to where the window really is.)
+    let fixed = scenario.fixed().map(|which| plan::fixed_plan(which, screen));
+    let (park, size) = fixed.map_or((plan::PARK, plan::default_size(screen)), |p| (p.park, p.size));
     if !app.window.park(park, size) {
         return Err("cannot place the window".into());
     }
@@ -592,16 +668,15 @@ fn drive(app: &mut App, cfg: &Config, scenario: Scenario) -> Result<(Observation
     let mut obs = Observations::default();
     let mut details = json!({});
     let prober = Prober::start(app.port, app.token.clone(), Duration::from_millis(cfg.limits.max_stall_ms as u64));
-    let drag = |app: &mut App, kind: Kind, sweep: Sweep, obs: &mut Observations| {
-        if let Err(e) = app.drag_border(kind, sweep, cfg.drag_seconds, 0.004) {
+    let drag = |app: &mut App, obs: &mut Observations| {
+        if let Some(p) = fixed
+            && let Err(e) = app.drag_border(p.kind, p.sweep, cfg.drag_seconds, 0.004)
+        {
             obs.step_failures.push(format!("{}: {e}", scenario.name()));
         }
     };
     match scenario {
-        Scenario::RightBorder => drag(app, Kind::RightEdge, Sweep { amplitude: 400, period_s: 0.3, shift: 0 }, &mut obs),
-        Scenario::BelowMinimum => drag(app, Kind::RightEdge, Sweep { amplitude: 800, period_s: 0.2, shift: -250 }, &mut obs),
-        Scenario::LeftBorder => drag(app, Kind::LeftEdge, Sweep { amplitude: -400, period_s: 0.4, shift: 0 }, &mut obs),
-        Scenario::Corner => drag(app, Kind::Corner, Sweep { amplitude: 250, period_s: 0.4, shift: 0 }, &mut obs),
+        Scenario::RightBorder | Scenario::BelowMinimum | Scenario::LeftBorder | Scenario::Corner => drag(app, &mut obs),
         Scenario::MaximizeRestore => app.maximize_restore(cfg.drag_seconds),
         Scenario::ApiStorm => {
             let sizes = app.api_storm(cfg.drag_seconds, cfg.seed, screen);
@@ -655,9 +730,13 @@ fn drive(app: &mut App, cfg: &Config, scenario: Scenario) -> Result<(Observation
     }
     details["gpu"] = gpu;
     details["missed_grabs"] = json!(app.missed_grabs);
+    // Anything the run did differently from what was asked (a sweep cut down to the display) is said here, not hidden.
+    details["notes"] = json!(app.notes);
     Ok((obs, details))
 }
 
+/// The JSON report of a run: the verdict and the problems behind it, the numbers it was judged on, and `details`
+/// (the GPU, and whatever the run did differently from what was asked: see `details.notes`).
 fn summarize(cfg: &Config, scenario: Scenario, obs: &Observations, problems: &[String], details: Value) -> Value {
     let latencies = obs.probes.iter().map(|p| p.latency_ms);
     let frames_per_s = match (obs.probes.first(), obs.probes.last()) {
@@ -672,7 +751,8 @@ fn summarize(cfg: &Config, scenario: Scenario, obs: &Observations, problems: &[S
         "args": cfg.extra_args,
         "seed": cfg.seed,
         "drag_seconds": cfg.drag_seconds,
-        "screen_px": win::screen_size(),
+        "screen_px": cfg.screen,
+        "real_screen_px": win::screen_size(),
         "details": details,
         "probes": {
             "answered": obs.probes.len(),

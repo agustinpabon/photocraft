@@ -36,6 +36,8 @@ impl Control {
         self.exchange(id, method, params)
     }
 
+    /// One request and its reply. Replies are matched by `id`, so one that answers a different request (a late
+    /// reply after a timeout, say) is an error and not mistaken for this one's answer.
     fn exchange(&mut self, id: Value, method: &str, params: Value) -> Result<Value, String> {
         let request = json!({"id": id, "method": method, "params": params}).to_string();
         let stream = self.reader.get_mut();

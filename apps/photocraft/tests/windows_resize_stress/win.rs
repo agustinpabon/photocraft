@@ -29,6 +29,8 @@ fn virtual_screen() -> (i32, i32, i32, i32) {
     )
 }
 
+/// Inject one mouse event. Whether the OS took it: it does not when a window of a more privileged process has
+/// the foreground (input cannot be injected into that).
 fn send_mouse(flags: co::MOUSEEVENTF, dx: i32, dy: i32) -> bool {
     let input = w::HwKbMouse::Mouse(w::MOUSEINPUT { dx, dy, mouseData: 0, dwFlags: flags, time: 0, dwExtraInfo: 0 });
     w::SendInput(&[input]).is_ok_and(|sent| sent == 1)
@@ -42,6 +44,7 @@ pub fn move_cursor(x: i32, y: i32) -> bool {
     send_mouse(co::MOUSEEVENTF::MOVE | co::MOUSEEVENTF::ABSOLUTE | co::MOUSEEVENTF::VIRTUALDESK, norm(x, ox, width), norm(y, oy, height))
 }
 
+/// Where the cursor is, in screen px; `None` when the OS will not say (the secure desktop has input, say).
 pub fn cursor() -> Option<(i32, i32)> {
     w::GetCursorPos().ok().map(|p| (p.x, p.y))
 }
@@ -50,6 +53,7 @@ pub fn cursor() -> Option<(i32, i32)> {
 pub struct HeldButton(());
 
 impl HeldButton {
+    /// Press the button where the cursor is now; `None` if the OS refused the press.
     pub fn press() -> Option<HeldButton> {
         send_mouse(co::MOUSEEVENTF::LEFTDOWN, 0, 0).then_some(HeldButton(()))
     }
@@ -115,10 +119,13 @@ impl Window {
         self.hwnd.SetWindowPos(w::HwndPlace::None, at, w::SIZE { cx: size.0, cy: size.1 }, flags).is_ok()
     }
 
+    /// Maximize the window. Like every `ShowWindow` call this returns only once the app has handled the resulting
+    /// `WM_SIZE`, which for PhotoCraft includes painting a frame, so it is a resize the app must keep up with.
     pub fn maximize(&self) {
         let _ = self.hwnd.ShowWindow(co::SW::SHOWMAXIMIZED);
     }
 
+    /// Restore the window from maximized, with the same blocking as [`Window::maximize`].
     pub fn restore(&self) {
         let _ = self.hwnd.ShowWindow(co::SW::RESTORE);
     }

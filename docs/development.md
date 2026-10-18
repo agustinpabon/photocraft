@@ -328,6 +328,8 @@ cargo test --release -p photocraft --test windows_resize_stress -- --ignored --t
 
 To try another GPU or backend, set what you would for the app: `WGPU_BACKEND=vulkan|dx12|gl`, `PHOTOCRAFT_PRESENT_MODE`, `PHOTOCRAFT_FRAME_LATENCY`, or `PHOTOCRAFT_STRESS_ARGS="--safe-gpu"` for the software adapter. `PHOTOCRAFT_STRESS_EXE` tests an installed or portable build instead of the one cargo built (v0.10.0 or later: older builds do not know `--new-instance`). `Auto` picks Vulkan on every GPU except Intel's, which gets DX12, so cover both on an Intel machine.
 
+On a small display the windows and sweeps are fitted to it, so the OS never pins the pointer at the screen's edge (which would look like someone else moving the mouse). Each drag's sweep is cut down to the room its real window leaves (the OS may have made the window bigger than planned, as at a display scale above 100 %), and its period shrinks with it, so the border still moves as fast. Anything cut is listed in the report's `details.notes`. A display with less than 60 px to spare fails the run with the numbers, rather than running a token sweep and passing. A 1366 × 768 display, for example, runs the corner sweep at 240 px instead of 250, while a display 800 px tall or more runs it as asked. `PHOTOCRAFT_STRESS_SCREEN=1366x768` plans for a smaller display than the real one (the windows and sweeps stay in that corner of it), to check those plans on a big screen.
+
 | Variable | Default | Effect |
 |---|---|---|
 | `PHOTOCRAFT_RESIZE_STRESS` | unset | `1` lets the tests take the mouse |
@@ -336,6 +338,7 @@ To try another GPU or backend, set what you would for the app: `WGPU_BACKEND=vul
 | `PHOTOCRAFT_STRESS_SECONDS` | `15` | how long each drag lasts |
 | `PHOTOCRAFT_STRESS_SOAK_SECONDS` | `60` | how long the soak lasts |
 | `PHOTOCRAFT_STRESS_SEED` | `7252` | seed of the soak plan and the storm's sizes |
+| `PHOTOCRAFT_STRESS_SCREEN` | the real display | `WxH` (at least `640x480`, at most the real size): plan for a smaller display |
 | `PHOTOCRAFT_STRESS_MAX_STALL_MS` | `3000` | the longest the UI thread may go without answering |
 | `PHOTOCRAFT_STRESS_MEMORY_GROWTH_MB` | `200` | the memory growth that fails a run |
 | `PHOTOCRAFT_STRESS_OUT` | none | a directory for each scenario's `summary.json` and the app's log |

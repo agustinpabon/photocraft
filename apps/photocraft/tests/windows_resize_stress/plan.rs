@@ -1,6 +1,9 @@
 //! The deterministic core of the resize stress test: where the cursor travels, what a soak run does for a
 //! given seed, and how a run is judged. Plain data and arithmetic, so it is unit-tested on every platform;
 //! `win.rs` and `main.rs` only drive Windows with it.
+//!
+//! Every size and position here is in physical pixels: the test process is DPI aware, so the display's size,
+//! window rectangles and cursor positions agree at any display scale.
 
 /// Where the test parks the window before a drag (its top-left, px): clear of the screen's corner, so the
 /// left and top borders can be grabbed too.
@@ -9,6 +12,20 @@ pub const PARK: (i32, i32) = (80, 40);
 pub const MARGIN: i32 = 60;
 /// px the cursor moves after the press, so that egui starts the drag and asks the OS to resize.
 pub const NUDGE_PX: i32 = 8;
+/// How close to the edge of the display the cursor may be sent. The OS pins the pointer at the edge, and an
+/// injected move lands a pixel off, so a drag that went further would look like the mouse leaving its path.
+pub const EDGE_GUARD_PX: i32 = 3;
+/// The least a sweep may travel and still stress anything. A display with less room than this fails the
+/// test with a message, rather than shrinking the sweep to nothing and passing.
+pub const MIN_TRAVEL_PX: i32 = 60;
+/// How far inside a window's right or bottom edge the grab point is: on the window, not the desktop behind it.
+const GRAB_INSET_PX: i32 = 4;
+/// How far inside a window's left edge the grab point is.
+const LEFT_GRAB_INSET_PX: i32 = 3;
+/// The shortest outer height a window is given: the app's minimum inner height (480 logical px), at 100 %.
+const MIN_WINDOW_HEIGHT: i32 = 480;
+/// The window size the scenarios that do not size it themselves start from, before it is fitted to the display.
+pub const DEFAULT_SIZE: (i32, i32) = (1100, 700);
 /// Seconds between `ui.inspect` probes while the window is being resized.
 pub const PROBE_INTERVAL_S: f64 = 0.25;
 
@@ -40,6 +57,7 @@ impl Rng {
         lo + (hi - lo) * unit
     }
 
+    /// An item chosen uniformly, or `None` for an empty slice.
     pub fn pick<T: Copy>(&mut self, items: &[T]) -> Option<T> {
         let n = u64::try_from(items.len()).ok().filter(|n| *n > 0)?;
         items.get(usize::try_from(self.next_u64() % n).ok()?).copied()
@@ -113,6 +131,28 @@ pub fn off_path(cursor: (i32, i32), grab: (i32, i32), axes: Axes) -> bool {
     }
 }
 
+/// What a drag's cursor made of the OS's pointer handling; see [`check_cursor`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CursorCheck {
+    /// On the line the drag moves along.
+    OnPath,
+    /// Off that line at the edge of the display, where the OS pins the pointer: the sweep ran out of screen.
+    AtScreenEdge,
+    /// Off that line in the open, which only something else moving the mouse can cause.
+    Moved,
+}
+
+/// Classify the cursor during a drag on a `screen`-sized display. A pointer the OS stopped at the display's
+/// edge looks just like a moved mouse to [`off_path`] (on a corner drag one coordinate stops, the other goes
+/// on), so the two are told apart: only a pointer off its line away from the edges is blamed on someone.
+pub fn check_cursor(cursor: (i32, i32), grab: (i32, i32), axes: Axes, screen: (i32, i32)) -> CursorCheck {
+    if !off_path(cursor, grab, axes) {
+        return CursorCheck::OnPath;
+    }
+    let at_edge = |v: i32, size: i32| v <= 1 || v >= size - 2;
+    if at_edge(cursor.0, screen.0) || at_edge(cursor.1, screen.1) { CursorCheck::AtScreenEdge } else { CursorCheck::Moved }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Kind {
     RightEdge,
@@ -121,6 +161,81 @@ pub enum Kind {
     /// Many short press-drag-release cycles, as a person re-grabbing the border.
     ShortGrabs,
     MaximizeRestore,
+}
+
+/// Where to press to grab the border or corner `kind` names (the bottom-right corner) of a window whose outer
+/// rectangle is `rect` (left, top, right, bottom), and which cursor coordinates the drag then moves. The point
+/// is a few px inside the window, where its resize zone is.
+pub fn grab_point(kind: Kind, rect: (i32, i32, i32, i32)) -> ((i32, i32), Axes) {
+    let (left, top, right, bottom) = rect;
+    let mid = (top + bottom) / 2;
+    match kind {
+        Kind::LeftEdge => ((left + LEFT_GRAB_INSET_PX, mid), Axes { x: true, y: false }),
+        Kind::Corner => ((right - GRAB_INSET_PX, bottom - GRAB_INSET_PX), Axes { x: true, y: true }),
+        _ => ((right - GRAB_INSET_PX, mid), Axes { x: true, y: false }),
+    }
+}
+
+/// px the cursor can still move from `grab` in `direction` (+1 right and down, -1 left and up) along `axes`
+/// before it is [`EDGE_GUARD_PX`] from the edge of a `screen`-sized display. The tighter axis counts, and the
+/// result is negative when `grab` is already past the guard.
+fn room(grab: (i32, i32), axes: Axes, screen: (i32, i32), direction: i32) -> i32 {
+    let on_axis = |moves: bool, at: i32, size: i32| moves.then(|| if direction > 0 { size - 1 - EDGE_GUARD_PX - at } else { at - EDGE_GUARD_PX });
+    [on_axis(axes.x, grab.0, screen.0), on_axis(axes.y, grab.1, screen.1)].into_iter().flatten().min().unwrap_or(i32::MAX)
+}
+
+/// A sweep cut down to the display by [`fit_sweep`].
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Fitted {
+    pub sweep: Sweep,
+    /// Whether the sweep had to be cut down from the one asked for (the report says so).
+    pub reduced: bool,
+}
+
+/// Fit `asked` to a `screen`-sized display for a drag that starts at `grab`: the whole drag (the nudge, the sweep
+/// and the return to the start) stays [`EDGE_GUARD_PX`] inside the display on every axis it moves, so the OS
+/// never stops the pointer. `grab` is the real one, from the window's real rectangle, so a window the OS made
+/// bigger than planned (the app's minimum size at a display scale above 100 %) is accounted for.
+///
+/// A sweep that does not fit is cut down, not dropped: its amplitude shrinks to the room there is and its
+/// period shrinks with it, so the border moves at the same speed. When the room is under [`MIN_TRAVEL_PX`]
+/// there is no meaningful sweep to make, and the error says so.
+pub fn fit_sweep(asked: Sweep, grab: (i32, i32), axes: Axes, screen: (i32, i32)) -> Result<Fitted, String> {
+    let (up, down) = (room(grab, axes, screen, 1), room(grab, axes, screen, -1));
+    let leftward = asked.amplitude < 0;
+    // The grab point itself has to be inside the guard (`down >= 0`), then the nudge and the return to the start
+    // (NUDGE_PX away on the sweep's side) have to fit.
+    if up < NUDGE_PX || down < 0 || (leftward && down < NUDGE_PX) {
+        return Err(format!(
+            "the cursor has no room to start this drag from {grab:?} on a {}x{} display: the window is too close to its edge",
+            screen.0, screen.1
+        ));
+    }
+    let mut sweep = asked;
+    // The sweep starts `NUDGE_PX + shift` from the grab point, which has to be on the display too.
+    sweep.shift = sweep.shift.max(-down - NUDGE_PX).min(up - NUDGE_PX);
+    let base = NUDGE_PX + sweep.shift;
+    sweep.amplitude = if leftward { asked.amplitude.max(-(down + base)) } else { asked.amplitude.min(up - base) };
+    if sweep.amplitude.abs() < MIN_TRAVEL_PX {
+        return Err(format!(
+            "a {}x{} display leaves {} px to resize from {grab:?}, and the test needs at least {MIN_TRAVEL_PX} px to mean anything: use a larger display",
+            screen.0,
+            screen.1,
+            sweep.amplitude.abs()
+        ));
+    }
+    if sweep.amplitude != asked.amplitude {
+        // The same speed over a shorter way: the same px per second.
+        sweep.period_s = (asked.period_s * f64::from(sweep.amplitude.abs()) / f64::from(asked.amplitude.abs())).max(0.03);
+    }
+    Ok(Fitted { sweep, reduced: sweep != asked })
+}
+
+/// The `WxH` size in `text` (as `PHOTOCRAFT_STRESS_SCREEN` gives it), if it is one a window can be placed in.
+pub fn parse_screen(text: &str) -> Option<(i32, i32)> {
+    let (w, h) = text.trim().split_once(['x', 'X'])?;
+    let (w, h) = (w.trim().parse::<i32>().ok()?, h.trim().parse::<i32>().ok()?);
+    (w >= 640 && h >= 480).then_some((w, h))
 }
 
 /// One step of a soak run.
@@ -144,6 +259,59 @@ fn fit(size: (i32, i32), screen: (i32, i32)) -> (i32, i32) {
     ((size.0).min(screen.0 - PARK.0 - 300).max(600), (size.1).min(screen.1 - PARK.1 - MARGIN).max(400))
 }
 
+/// The size a window starts from when the scenario does not choose one, fitted to a `screen`-sized display.
+pub fn default_size(screen: (i32, i32)) -> (i32, i32) {
+    fit(DEFAULT_SIZE, screen)
+}
+
+/// Where a window of `size` is parked so that its left border can travel left: against the display's right side.
+fn left_park(size: (i32, i32), screen: (i32, i32)) -> (i32, i32) {
+    ((screen.0 - MARGIN - size.0).max(PARK.0), PARK.1)
+}
+
+/// The drags the fixed (non-soak) scenarios make.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Fixed {
+    RightBorder,
+    LeftBorder,
+    Corner,
+    BelowMinimum,
+}
+
+/// Where a fixed scenario parks the window, and the drag it makes there.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct DragPlan {
+    pub kind: Kind,
+    pub park: (i32, i32),
+    pub size: (i32, i32),
+    /// The sweep asked for. [`fit_sweep`] cuts it down to what the real window and display allow.
+    pub sweep: Sweep,
+}
+
+/// What `which` does on a `screen`-sized display. The window is fitted to the display, and the corner's window is
+/// kept short enough to leave room below it for the whole diagonal sweep (a border sweep only needs room to the
+/// side), so a display of 1280 x 800 or more runs the sweeps as asked and a 1366 x 768 one loses only a few px.
+pub fn fixed_plan(which: Fixed, screen: (i32, i32)) -> DragPlan {
+    match which {
+        Fixed::RightBorder => {
+            DragPlan { kind: Kind::RightEdge, park: PARK, size: default_size(screen), sweep: Sweep { amplitude: 400, period_s: 0.3, shift: 0 } }
+        }
+        Fixed::BelowMinimum => {
+            DragPlan { kind: Kind::RightEdge, park: PARK, size: fit((900, 700), screen), sweep: Sweep { amplitude: 800, period_s: 0.2, shift: -250 } }
+        }
+        Fixed::LeftBorder => {
+            let size = default_size(screen);
+            DragPlan { kind: Kind::LeftEdge, park: left_park(size, screen), size, sweep: Sweep { amplitude: -400, period_s: 0.4, shift: 0 } }
+        }
+        Fixed::Corner => {
+            let sweep = Sweep { amplitude: 250, period_s: 0.4, shift: 0 };
+            let below = sweep.amplitude + NUDGE_PX + GRAB_INSET_PX + EDGE_GUARD_PX + 1;
+            let height = (screen.1 - PARK.1 - below).max(MIN_WINDOW_HEIGHT).min(DEFAULT_SIZE.1);
+            DragPlan { kind: Kind::Corner, park: PARK, size: (default_size(screen).0, height), sweep }
+        }
+    }
+}
+
 /// A seeded plan of segments adding up to at least `seconds`, for a primary display of `screen` px. The
 /// same seed and screen give the same plan.
 pub fn soak_plan(seed: u64, seconds: f64, screen: (i32, i32)) -> Vec<Segment> {
@@ -154,9 +322,13 @@ pub fn soak_plan(seed: u64, seconds: f64, screen: (i32, i32)) -> Vec<Segment> {
         let kind = rng
             .weighted(&[(Kind::RightEdge, 5), (Kind::LeftEdge, 2), (Kind::Corner, 3), (Kind::ShortGrabs, 2), (Kind::MaximizeRestore, 1)])
             .unwrap_or(Kind::RightEdge);
-        let size = fit(rng.pick(&START_SIZES).unwrap_or((1000, 650)), screen);
+        let mut size = fit(rng.pick(&START_SIZES).unwrap_or((1000, 650)), screen);
+        if kind == Kind::Corner {
+            // A corner also travels down: on a short display the window gives up height so that at least 100 px remain.
+            size.1 = size.1.min(screen.1 - PARK.1 - MARGIN - 100).max(MIN_WINDOW_HEIGHT);
+        }
         // A left border needs room to travel left, so that window sits against the screen's right side.
-        let park = if kind == Kind::LeftEdge { ((screen.0 - MARGIN - size.0).max(PARK.0), PARK.1) } else { PARK };
+        let park = if kind == Kind::LeftEdge { left_park(size, screen) } else { PARK };
         let room_right = (screen.0 - park.0 - size.0 - MARGIN).max(0);
         let room_below = (screen.1 - park.1 - size.1 - MARGIN).max(0);
         let room_left = (park.0 - MARGIN / 2).max(0);
@@ -166,7 +338,7 @@ pub fn soak_plan(seed: u64, seconds: f64, screen: (i32, i32)) -> Vec<Segment> {
                 (rng.range(250, 900).min(room_right).max(60), rng.pick(&[0, -150, -350]).unwrap_or(0), rng.pick(&[0.001, 0.004, 0.008]).unwrap_or(0.004))
             }
             Kind::LeftEdge => (-rng.range(150, 400).min(room_left).max(60), 0, rng.pick(&[0.002, 0.004]).unwrap_or(0.004)),
-            Kind::Corner => (rng.range(150, 300).min(room_right).min(room_below).max(40), rng.pick(&[0, -100, -250]).unwrap_or(0), 0.004),
+            Kind::Corner => (rng.range(150, 300).min(room_right).min(room_below).max(MIN_TRAVEL_PX), rng.pick(&[0, -100, -250]).unwrap_or(0), 0.004),
             Kind::ShortGrabs => (rng.range(60, 300).min(room_right).max(40), 0, 0.004),
             Kind::MaximizeRestore => (0, 0, 0.004),
         };
@@ -299,6 +471,7 @@ mod tests {
 
     const SCREEN: (i32, i32) = (1920, 1080);
 
+    /// A run in which nothing went wrong, for a test to spoil one field of.
     fn healthy() -> Observations {
         Observations {
             probes: (1u32..=20).map(|i| Probe { at_s: f64::from(i) * 0.25, latency_ms: 4.0, frame: u64::from(i) * 15 }).collect(),
@@ -457,6 +630,232 @@ mod tests {
         // A stall before the first answer and after the last one counts as well.
         assert_eq!(max_gap_ms(&[Probe { at_s: 2.0, latency_ms: 1.0, frame: 1 }], 2.5), 2000.0);
         assert_eq!(max_gap_ms(&[Probe { at_s: 0.5, latency_ms: 1.0, frame: 1 }], 4.5), 4000.0);
+    }
+
+    /// The displays the review of the first version named, where the corner sweep ran off the screen.
+    const SMALL_DISPLAYS: [(i32, i32); 3] = [(1366, 768), (1600, 900), (1280, 800)];
+    /// Displays this test is likely to meet, from the smallest laptops to 4K.
+    const DISPLAYS: [(i32, i32); 10] =
+        [(1280, 720), (1280, 800), (1366, 768), (1440, 900), (1600, 900), (1680, 1050), (1920, 1080), (2560, 1440), (3440, 1440), (3840, 2160)];
+    const FIXED: [Fixed; 4] = [Fixed::RightBorder, Fixed::LeftBorder, Fixed::Corner, Fixed::BelowMinimum];
+
+    /// Where the OS leaves a pointer sent to `p`: never past the edge of the display.
+    fn pinned(p: (i32, i32), screen: (i32, i32)) -> (i32, i32) {
+        (p.0.clamp(0, screen.0 - 1), p.1.clamp(0, screen.1 - 1))
+    }
+
+    /// Every cursor position a drag visits: the nudge after the press, the sweep (over two periods) and the return.
+    fn visited(grab: (i32, i32), axes: Axes, sweep: Sweep) -> Vec<(i32, i32)> {
+        let direction = if sweep.amplitude < 0 { -1 } else { 1 };
+        let nudge = (1..=NUDGE_PX).map(|i| point_at(grab, axes, direction * i));
+        let swept = (0..=400).map(|i| point_at(grab, axes, sweep.offset(f64::from(i) * sweep.period_s / 200.0)));
+        nudge.chain(swept).chain([point_at(grab, axes, NUDGE_PX)]).collect()
+    }
+
+    /// The grab point and axes of a fixed plan's drag, from the rectangle it parks the window at.
+    fn grab_of(plan: &DragPlan) -> ((i32, i32), Axes) {
+        grab_point(plan.kind, (plan.park.0, plan.park.1, plan.park.0 + plan.size.0, plan.park.1 + plan.size.1))
+    }
+
+    /// Whether `p` is on the display, with the guard, on every axis the drag moves.
+    fn on_screen(p: (i32, i32), axes: Axes, screen: (i32, i32)) -> bool {
+        let inside = |v: i32, size: i32| (EDGE_GUARD_PX..=size - 1 - EDGE_GUARD_PX).contains(&v);
+        (!axes.x || inside(p.0, screen.0)) && (!axes.y || inside(p.1, screen.1))
+    }
+
+    /// px per second the border travels at.
+    fn speed(s: Sweep) -> f64 {
+        2.0 * f64::from(s.amplitude.abs()) / s.period_s
+    }
+
+    #[test]
+    fn the_corner_sweep_as_first_written_ran_off_these_displays() {
+        // The first version: a 1100 x 700 window at (80, 40), a corner grab 4 px inside it and 250 px of sweep on
+        // both axes took the cursor to (1434, 994): past the bottom of a 768, 800 or 900 px high display.
+        let (park, size, sweep) = (PARK, (1100, 700), Sweep { amplitude: 250, period_s: 0.4, shift: 0 });
+        let (grab, axes) = grab_point(Kind::Corner, (park.0, park.1, park.0 + size.0, park.1 + size.1));
+        let far = point_at(grab, axes, sweep.offset(sweep.period_s / 2.0));
+        assert_eq!(far, (1434, 994));
+        for screen in SMALL_DISPLAYS {
+            assert!(far.1 > screen.1 - 1, "{screen:?}: the target is below the display");
+            let pointer = pinned(far, screen);
+            // The OS stops y at the bottom edge while x goes on, so the pointer is off its diagonal ...
+            assert!(off_path(pointer, grab, axes), "{screen:?}: {pointer:?}");
+            // ... which is the display's doing, and must not be put down to a person.
+            assert_eq!(check_cursor(pointer, grab, axes, screen), CursorCheck::AtScreenEdge, "{screen:?}");
+        }
+        assert!(far.0 < 1919 && far.1 < 1079, "a 1920 x 1080 display holds it");
+    }
+
+    #[test]
+    fn a_pointer_the_display_stopped_is_never_blamed_on_the_user() {
+        let corner = Axes { x: true, y: true };
+        let x_only = Axes { x: true, y: false };
+        let (grab, screen) = ((1176, 736), (1600, 900));
+        // Every point of a sweep that runs off the display, pinned by it, is on the path or at the edge: never "moved".
+        for i in 0..=100 {
+            let wanted = point_at(grab, corner, NUDGE_PX + i * 3);
+            assert_ne!(check_cursor(pinned(wanted, screen), grab, corner, screen), CursorCheck::Moved, "offset {i}");
+        }
+        // Away from the edges, a pointer off its line is still someone else's doing ...
+        assert_eq!(check_cursor((1300, 420), grab, x_only, screen), CursorCheck::Moved);
+        assert_eq!(check_cursor((1290, 600), grab, corner, screen), CursorCheck::Moved);
+        // ... and one on its line is fine, as is an x-only drag whose pointer stops at the right edge (only y matters to it).
+        assert_eq!(check_cursor((1276, 836), grab, corner, screen), CursorCheck::OnPath);
+        assert_eq!(check_cursor((1599, 736), grab, x_only, screen), CursorCheck::OnPath);
+    }
+
+    #[test]
+    fn every_fixed_scenario_fits_every_common_display() {
+        for screen in DISPLAYS {
+            for which in FIXED {
+                let plan = fixed_plan(which, screen);
+                let label = format!("{which:?} on {screen:?}");
+                assert!(plan.park.0 + plan.size.0 <= screen.0 && plan.park.1 + plan.size.1 <= screen.1, "{label}: the window does not fit: {plan:?}");
+                let (grab, axes) = grab_of(&plan);
+                let fitted = fit_sweep(plan.sweep, grab, axes, screen).unwrap_or_else(|e| panic!("{label}: {e}"));
+                for p in visited(grab, axes, fitted.sweep) {
+                    assert!(on_screen(p, axes, screen), "{label}: {p:?} is off the display; sweep {:?}", fitted.sweep);
+                }
+                // Cut down to fit, not gutted, and no slower.
+                assert!(fitted.sweep.amplitude.abs() * 2 >= plan.sweep.amplitude.abs(), "{label}: {:?} from {:?}", fitted.sweep, plan.sweep);
+                assert!((speed(fitted.sweep) - speed(plan.sweep)).abs() < 1e-6, "{label}: the border slowed down");
+                assert_eq!(fitted.reduced, fitted.sweep != plan.sweep, "{label}");
+            }
+        }
+    }
+
+    #[test]
+    fn the_small_displays_run_the_corner_sweep_as_asked_or_nearly() {
+        let corner = |screen| {
+            let plan = fixed_plan(Fixed::Corner, screen);
+            let (grab, axes) = grab_of(&plan);
+            fit_sweep(plan.sweep, grab, axes, screen).unwrap()
+        };
+        // 1280 x 800 and 1600 x 900 hold the whole sweep: the window is made just short enough.
+        for screen in [(1280, 800), (1600, 900)] {
+            let fitted = corner(screen);
+            assert!(!fitted.reduced, "{screen:?}: {fitted:?}");
+            assert_eq!(fitted.sweep.amplitude, 250);
+        }
+        // 1366 x 768 gives up 10 px of it: the window is already at the app's minimum height there.
+        assert_eq!(fixed_plan(Fixed::Corner, (1366, 768)).size.1, 480);
+        let fitted = corner((1366, 768));
+        assert!(fitted.reduced);
+        assert_eq!(fitted.sweep.amplitude, 240);
+        assert!((speed(fitted.sweep) - 2.0 * 250.0 / 0.4).abs() < 1e-6, "at the same speed");
+    }
+
+    #[test]
+    fn a_display_with_no_room_is_reported_not_skipped() {
+        let check = |which: Fixed, screen: (i32, i32)| {
+            let plan = fixed_plan(which, screen); // planning never panics, however small the display
+            let (grab, axes) = grab_of(&plan);
+            fit_sweep(plan.sweep, grab, axes, screen)
+        };
+        // 640 x 480: these windows start past the display's edge, so there is nowhere to press.
+        for which in [Fixed::RightBorder, Fixed::BelowMinimum, Fixed::Corner] {
+            let error = check(which, (640, 480)).expect_err("the window starts off the display");
+            assert!(error.contains("640x480") && error.contains("no room to start"), "{which:?}: {error}");
+        }
+        // The left border still has 80 px to travel there: a short sweep, reported as cut down, not an error.
+        let left = check(Fixed::LeftBorder, (640, 480)).unwrap();
+        assert!(left.reduced && left.sweep.amplitude == -88, "{left:?}");
+        // 700 x 600: room to start, but 12 px of travel are not a stress test.
+        let error = check(Fixed::RightBorder, (700, 600)).expect_err("12 px of travel");
+        assert!(error.contains("700x600") && error.contains(&format!("at least {MIN_TRAVEL_PX}")), "{error}");
+    }
+
+    #[test]
+    fn fitting_cuts_a_sweep_to_the_room_and_keeps_its_speed() {
+        let screen = (1366, 768);
+        let x_only = Axes { x: true, y: false };
+        let asked = Sweep { amplitude: 400, period_s: 0.3, shift: 0 };
+        // 300 px are left to the right of the grab point once the guard is kept: 292 after the 8 px nudge.
+        let fitted = fit_sweep(asked, (1062, 384), x_only, screen).unwrap();
+        assert!(fitted.reduced);
+        assert_eq!(fitted.sweep.amplitude, 292);
+        assert!((speed(fitted.sweep) - speed(asked)).abs() < 1e-6);
+        // A sweep that fits comes back as asked.
+        let roomy = fit_sweep(asked, (1062, 384), x_only, (1920, 1080)).unwrap();
+        assert_eq!((roomy.sweep, roomy.reduced), (asked, false));
+        // A left border goes the other way.
+        let left = fit_sweep(Sweep { amplitude: -400, period_s: 0.4, shift: 0 }, (323, 384), x_only, screen).unwrap();
+        assert_eq!(left.sweep.amplitude, -328);
+        // A sweep that starts inside the window stays on the display too: 97 px of room, minus the nudge.
+        let inward = fit_sweep(Sweep { amplitude: 800, period_s: 0.2, shift: -250 }, (100, 384), x_only, screen).unwrap();
+        assert_eq!(inward.sweep.shift, -105);
+        // A corner is held by whichever axis has the least room.
+        let both = Axes { x: true, y: true };
+        let diagonal = fit_sweep(Sweep { amplitude: 250, period_s: 0.4, shift: 0 }, (1062, 564), both, screen).unwrap();
+        assert_eq!(diagonal.sweep.amplitude, 200 - NUDGE_PX);
+    }
+
+    #[test]
+    fn fitting_refuses_a_start_with_no_room_and_a_sweep_too_short_to_mean_anything() {
+        let x_only = Axes { x: true, y: false };
+        let sweep = Sweep { amplitude: 400, period_s: 0.3, shift: 0 };
+        let screen = (1366, 768);
+        // 5 px from the right edge: not even the nudge fits. Likewise a left border 5 px from the left edge.
+        let error = fit_sweep(sweep, (1361, 100), x_only, screen).unwrap_err();
+        assert!(error.contains("no room to start"), "{error}");
+        let error = fit_sweep(Sweep { amplitude: -400, ..sweep }, (8, 100), x_only, screen).unwrap_err();
+        assert!(error.contains("no room to start"), "{error}");
+        // A grab point already inside the edge guard is refused whichever way the sweep goes (the nudge would cross it).
+        let error = fit_sweep(sweep, (1, 100), x_only, screen).unwrap_err();
+        assert!(error.contains("no room to start"), "{error}");
+        // 30 px of travel are not a stress test, and 60 are.
+        let error = fit_sweep(sweep, (1366 - 1 - EDGE_GUARD_PX - NUDGE_PX - 30, 100), x_only, screen).unwrap_err();
+        assert!(error.contains("1366x768") && error.contains(&format!("at least {MIN_TRAVEL_PX}")), "{error}");
+        let fitted = fit_sweep(sweep, (1366 - 1 - EDGE_GUARD_PX - NUDGE_PX - MIN_TRAVEL_PX, 100), x_only, screen).unwrap();
+        assert_eq!(fitted.sweep.amplitude, MIN_TRAVEL_PX);
+    }
+
+    #[test]
+    fn a_fitted_sweep_never_leaves_the_display() {
+        let mut rng = Rng::new(7252);
+        let mut fitted_count = 0;
+        for _ in 0..20_000 {
+            let screen = rng.pick(&DISPLAYS).unwrap_or((1920, 1080));
+            let axes = if rng.range(0, 1) == 0 { Axes { x: true, y: false } } else { Axes { x: true, y: true } };
+            let grab = (rng.range(0, screen.0 - 1), rng.range(0, screen.1 - 1));
+            let asked = Sweep { amplitude: rng.range(-900, 900), period_s: rng.float(0.05, 1.0), shift: rng.range(-400, 100) };
+            if let Ok(fitted) = fit_sweep(asked, grab, axes, screen) {
+                fitted_count += 1;
+                for p in visited(grab, axes, fitted.sweep) {
+                    assert!(on_screen(p, axes, screen), "{p:?} is off a {screen:?} display: grab {grab:?}, asked {asked:?}, fitted {:?}", fitted.sweep);
+                }
+                assert!(fitted.sweep.amplitude.abs() >= MIN_TRAVEL_PX && fitted.sweep.amplitude.abs() <= asked.amplitude.abs());
+                assert_eq!(fitted.sweep.amplitude.signum(), asked.amplitude.signum(), "a sweep never changes direction");
+            }
+        }
+        assert!(fitted_count > 2_000, "the property was exercised: {fitted_count}");
+    }
+
+    #[test]
+    fn fitting_leaves_every_soak_segment_as_planned() {
+        for screen in DISPLAYS {
+            for seed in 0..40 {
+                for seg in soak_plan(seed, 120.0, screen) {
+                    let kind = if seg.kind == Kind::ShortGrabs { Kind::RightEdge } else { seg.kind };
+                    if kind == Kind::MaximizeRestore {
+                        continue;
+                    }
+                    let (grab, axes) = grab_point(kind, (seg.park.0, seg.park.1, seg.park.0 + seg.size.0, seg.park.1 + seg.size.1));
+                    let fitted = fit_sweep(seg.sweep, grab, axes, screen).unwrap_or_else(|e| panic!("{screen:?} seed {seed}: {seg:?}: {e}"));
+                    assert!(!fitted.reduced, "{screen:?} seed {seed}: the plan already fits, yet {seg:?} was cut to {:?}", fitted.sweep);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_display_size_is_wxh() {
+        assert_eq!(parse_screen("1366x768"), Some((1366, 768)));
+        assert_eq!(parse_screen(" 1280 X 800 "), Some((1280, 800)));
+        for bad in ["", "banana", "1366", "1366x", "x768", "0x0", "-1366x768", "639x480", "1366x479", "1366x768x2", "13.5x7"] {
+            assert_eq!(parse_screen(bad), None, "{bad:?}");
+        }
     }
 
     #[test]
