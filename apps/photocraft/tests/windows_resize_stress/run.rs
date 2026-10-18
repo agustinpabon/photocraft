@@ -154,12 +154,49 @@ struct App {
     notes: BTreeSet<String>,
 }
 
+/// What one attempt to start the app is given: its own settings folder, the folder it may write to, the file its
+/// control token goes in, and the control port to bind.
+struct Start<'a> {
+    port: u16,
+    settings: &'a Path,
+    out: &'a Path,
+    token_file: &'a Path,
+}
+
 impl App {
     /// Start an isolated PhotoCraft (its own settings folder, control port and token) and wait until its control
-    /// server answers and its main window exists. On failure the error carries the end of the app's log.
+    /// server answers and its main window exists. On failure the error carries the end of the app's log, and the
+    /// settings folder, with the app's own log file, is kept and named in it, as for a run that fails later.
     fn launch(cfg: &Config, name: &str) -> Result<App, String> {
+        App::launch_in(Path::new(env!("CARGO_TARGET_TMPDIR")), name, cfg.screen, |start| {
+            let mut command = Command::new(&cfg.exe);
+            command
+                .args(["--new-instance", "--control"])
+                .arg(start.port.to_string())
+                .arg("--control-token-file")
+                .arg(start.token_file)
+                .arg("--automation-write-root")
+                .arg(start.out)
+                .args(&cfg.extra_args)
+                .env("PHOTOCRAFT_CONFIG_DIR", start.settings)
+                .env("RUST_BACKTRACE", "1")
+                // A control port, token or automation root from the caller's shell must not leak into the test.
+                .env_remove("PHOTOCRAFT_CONTROL_PORT")
+                .env_remove("PHOTOCRAFT_CONTROL_TOKEN")
+                .env_remove("PHOTOCRAFT_CONTROL_TOKEN_FILE")
+                .env_remove("PHOTOCRAFT_AUTOMATION_READ_ROOT")
+                .env_remove("PHOTOCRAFT_AUTOMATION_WRITE_ROOT");
+            command
+        })
+    }
+
+    /// [`App::launch`] with the folder the throwaway settings go under, and the command that starts the app, left to
+    /// the caller, so that a start that fails can be simulated.
+    fn launch_in(root: &Path, name: &str, screen: (i32, i32), mut command: impl FnMut(&Start) -> Command) -> Result<App, String> {
         let stamp = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_nanos());
-        let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!("resize-stress-{name}-{}-{stamp}", std::process::id()));
+        let dir = root.join(format!("resize-stress-{name}-{}-{stamp}", std::process::id()));
+        // Absolute, because failures name it.
+        let dir = std::path::absolute(&dir).unwrap_or(dir);
         let (settings, out) = (dir.join("settings"), dir.join("out"));
         for d in [&settings, &out] {
             std::fs::create_dir_all(d).map_err(|e| format!("create {}: {e}", d.display()))?;
@@ -169,27 +206,13 @@ impl App {
         // Another process can take the port between choosing it and the app binding it: try again.
         for _ in 0..3 {
             let port = free_port()?;
-            let mut child = Command::new(&cfg.exe)
-                .args(["--new-instance", "--control"])
-                .arg(port.to_string())
-                .arg("--control-token-file")
-                .arg(&token_file)
-                .arg("--automation-write-root")
-                .arg(&out)
-                .args(&cfg.extra_args)
-                .env("PHOTOCRAFT_CONFIG_DIR", &settings)
-                .env("RUST_BACKTRACE", "1")
-                // A control port, token or automation root from the caller's shell must not leak into the test.
-                .env_remove("PHOTOCRAFT_CONTROL_PORT")
-                .env_remove("PHOTOCRAFT_CONTROL_TOKEN")
-                .env_remove("PHOTOCRAFT_CONTROL_TOKEN_FILE")
-                .env_remove("PHOTOCRAFT_AUTOMATION_READ_ROOT")
-                .env_remove("PHOTOCRAFT_AUTOMATION_WRITE_ROOT")
+            let mut cmd = command(&Start { port, settings: &settings, out: &out, token_file: &token_file });
+            let mut child = cmd
                 .stdin(Stdio::null())
                 .stdout(Stdio::null())
                 .stderr(Stdio::piped())
                 .spawn()
-                .map_err(|e| format!("start {}: {e}", cfg.exe.display()))?;
+                .map_err(|e| format!("start {}: {e}", cmd.get_program().to_string_lossy()))?;
             let log: Log = Arc::default();
             if let Some(stderr) = child.stderr.take() {
                 let sink = Arc::clone(&log);
@@ -201,7 +224,7 @@ impl App {
             }
             match wait_until_ready(&mut child, &log, port, &token_file) {
                 Ok((token, window)) => {
-                    return Ok(App { child, window, port, token, dir, log, keep_dir: false, missed_grabs: 0, screen: cfg.screen, notes: BTreeSet::new() });
+                    return Ok(App { child, window, port, token, dir, log, keep_dir: false, missed_grabs: 0, screen, notes: BTreeSet::new() });
                 }
                 Err(error) => {
                     let _ = child.kill();
@@ -213,8 +236,8 @@ impl App {
                 }
             }
         }
-        let _ = std::fs::remove_dir_all(&dir);
-        Err(last)
+        // The folder stays: the app's own log file is in it, and an app that never came up is when it is wanted most.
+        Err(format!("{last}\n(kept in {})", dir.display()))
     }
 
     /// How the app ended, if it has.
@@ -768,4 +791,90 @@ fn summarize(cfg: &Config, scenario: Scenario, obs: &Observations, problems: &[S
         "memory_mb": obs.memory_mb,
         "limits": {"max_stall_ms": cfg.limits.max_stall_ms, "memory_growth_mb": cfg.limits.memory_growth_mb, "size_tolerance_px": cfg.limits.size_tolerance_px},
     })
+}
+
+/// Starts that fail, simulated with a stand-in for the app: no window, no mouse, and no wait for the real 180 s
+/// timeout. What matters is what a failed start leaves behind to explain itself.
+#[cfg(test)]
+mod tests {
+    use std::cell::Cell;
+    use std::os::windows::process::CommandExt;
+
+    use super::*;
+
+    /// A folder for one test's starts, removed when the test ends however it ends.
+    struct Root(PathBuf);
+
+    impl Root {
+        fn new(test: &str) -> Root {
+            Root(Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!("launch-{test}-{}", std::process::id())))
+        }
+
+        /// The folders the starts left behind.
+        fn kept(&self) -> Vec<PathBuf> {
+            std::fs::read_dir(&self.0).map(|entries| entries.filter_map(Result::ok).map(|e| e.path()).collect()).unwrap_or_default()
+        }
+    }
+
+    impl Drop for Root {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// `cmd /C script`: a stand-in for the app that writes to its standard error and then ends, or stays up.
+    fn stand_in(script: &str) -> Command {
+        let mut command = Command::new("cmd");
+        command.arg("/C").raw_arg(format!("\"{script}\""));
+        command
+    }
+
+    /// The error of a start that must fail.
+    fn failed(started: Result<App, String>) -> String {
+        match started {
+            Ok(_) => panic!("the stand-in for the app cannot come up"),
+            Err(error) => error,
+        }
+    }
+
+    #[test]
+    fn a_start_that_fails_keeps_its_settings_folder_and_names_it() {
+        let root = Root::new("keeps");
+        let token = "0123456789abcdef".repeat(4);
+        let starts = Cell::new(0);
+        let error = failed(App::launch_in(&root.0, "fake", (1920, 1080), |start| {
+            starts.set(starts.get() + 1);
+            // What the app writes before it dies: its own log file, and its control token.
+            let logs = start.settings.join("logs");
+            std::fs::create_dir_all(&logs).unwrap();
+            std::fs::write(logs.join("photocraft.log"), "startup diagnostics\n").unwrap();
+            std::fs::write(start.token_file, &token).unwrap();
+            stand_in("echo the app is gone 1>&2 & exit /b 3")
+        }));
+        assert_eq!(starts.get(), 1, "only a taken control port is tried again: {error}");
+        let kept = root.kept();
+        assert_eq!(kept.len(), 1, "{kept:?}");
+        let dir = &kept[0];
+        assert!(dir.is_absolute(), "{dir:?}");
+        assert!(error.contains(&format!("(kept in {})", dir.display())), "{error}");
+        assert!(error.contains("exited while starting") && error.contains("the app is gone"), "{error}");
+        assert_eq!(std::fs::read_to_string(dir.join("settings").join("logs").join("photocraft.log")).unwrap(), "startup diagnostics\n");
+        assert!(!error.contains(&token), "the control token must not be in the message: {error}");
+    }
+
+    #[test]
+    fn a_taken_control_port_is_tried_again_and_a_start_that_never_works_is_still_kept() {
+        let root = Root::new("port");
+        let starts = Cell::new(0);
+        let error = failed(App::launch_in(&root.0, "fake", (1920, 1080), |_| {
+            starts.set(starts.get() + 1);
+            // Reports the port as taken and stays up, as the app does (`ping` is only a way to wait 2 s).
+            stand_in("echo photocraft: control server failed to bind 127.0.0.1:1 1>&2 & ping -n 3 127.0.0.1 >nul")
+        }));
+        assert_eq!(starts.get(), 3, "{error}");
+        assert!(error.contains("the control port was taken"), "{error}");
+        let kept = root.kept();
+        assert_eq!(kept.len(), 1, "{kept:?}");
+        assert!(error.contains(&format!("(kept in {})", kept[0].display())), "{error}");
+    }
 }
