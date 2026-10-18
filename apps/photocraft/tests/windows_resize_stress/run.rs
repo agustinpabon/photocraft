@@ -7,9 +7,9 @@
 //! `target/tmp`.
 
 use std::collections::BTreeSet;
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, ChildStderr, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::thread::{self, JoinHandle};
@@ -114,6 +114,34 @@ fn log_tail(log: &Log, n: usize) -> String {
     lines.iter().skip(lines.len().saturating_sub(n)).cloned().collect::<Vec<_>>().join("\n")
 }
 
+/// Read `stderr` line by line into `log` in a thread, so that the app never blocks on a full pipe.
+fn capture_stderr(stderr: impl Read + Send + 'static, log: &Log) -> JoinHandle<()> {
+    let sink = Arc::clone(log);
+    thread::spawn(move || {
+        for line in BufReader::new(stderr).lines().map_while(Result::ok) {
+            sink.lock().unwrap_or_else(PoisonError::into_inner).push(line);
+        }
+    })
+}
+
+/// How long a failed start waits for the thread reading the app's standard error to take in the last of it.
+const STDERR_GRACE: Duration = Duration::from_millis(500);
+
+/// Wait for `reader` to reach the end of the app's standard error, for at most `grace`; whether it did. The app has
+/// ended by then, so this is quick, unless something it started still holds the pipe open: that must not stall a
+/// failure, so the thread is left running when it is not done.
+fn reader_finished(reader: JoinHandle<()>, grace: Duration) -> bool {
+    let deadline = Instant::now() + grace;
+    while !reader.is_finished() {
+        if Instant::now() >= deadline {
+            return false;
+        }
+        thread::sleep(Duration::from_millis(5));
+    }
+    let _ = reader.join();
+    true
+}
+
 /// A loopback port that was free a moment ago. The app binds it later, so [`App::launch`] tries again with a new
 /// one if something else got there first.
 fn free_port() -> Result<u16, String> {
@@ -168,7 +196,7 @@ impl App {
     /// server answers and its main window exists. On failure the error carries the end of the app's log, and the
     /// settings folder, with the app's own log file, is kept and named in it, as for a run that fails later.
     fn launch(cfg: &Config, name: &str) -> Result<App, String> {
-        App::launch_in(Path::new(env!("CARGO_TARGET_TMPDIR")), name, cfg.screen, |start| {
+        App::launch_in(Path::new(env!("CARGO_TARGET_TMPDIR")), name, cfg.screen, capture_stderr, |start| {
             let mut command = Command::new(&cfg.exe);
             command
                 .args(["--new-instance", "--control"])
@@ -190,9 +218,15 @@ impl App {
         })
     }
 
-    /// [`App::launch`] with the folder the throwaway settings go under, and the command that starts the app, left to
-    /// the caller, so that a start that fails can be simulated.
-    fn launch_in(root: &Path, name: &str, screen: (i32, i32), mut command: impl FnMut(&Start) -> Command) -> Result<App, String> {
+    /// [`App::launch`] with the folder the throwaway settings go under, the reader of the app's standard error and
+    /// the command that starts the app left to the caller, so that a start that fails can be simulated.
+    fn launch_in(
+        root: &Path,
+        name: &str,
+        screen: (i32, i32),
+        capture: impl Fn(ChildStderr, &Log) -> JoinHandle<()>,
+        mut command: impl FnMut(&Start) -> Command,
+    ) -> Result<App, String> {
         let stamp = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_nanos());
         let dir = root.join(format!("resize-stress-{name}-{}-{stamp}", std::process::id()));
         // Absolute, because failures name it.
@@ -214,14 +248,7 @@ impl App {
                 .spawn()
                 .map_err(|e| format!("start {}: {e}", cmd.get_program().to_string_lossy()))?;
             let log: Log = Arc::default();
-            if let Some(stderr) = child.stderr.take() {
-                let sink = Arc::clone(&log);
-                thread::spawn(move || {
-                    for line in BufReader::new(stderr).lines().map_while(Result::ok) {
-                        sink.lock().unwrap_or_else(PoisonError::into_inner).push(line);
-                    }
-                });
-            }
+            let reader = child.stderr.take().map(|stderr| capture(stderr, &log));
             match wait_until_ready(&mut child, &log, port, &token_file) {
                 Ok((token, window)) => {
                     return Ok(App { child, window, port, token, dir, log, keep_dir: false, missed_grabs: 0, screen, notes: BTreeSet::new() });
@@ -229,7 +256,13 @@ impl App {
                 Err(error) => {
                     let _ = child.kill();
                     let _ = child.wait();
-                    last = format!("{error}\n--- the app's log ---\n{}", log_tail(&log, 40));
+                    // The app is gone, so all it wrote is in the pipe: let the reader take it in before it is read.
+                    let note = if reader.is_none_or(|reader| reader_finished(reader, STDERR_GRACE)) {
+                        String::new()
+                    } else {
+                        format!("\n(the app's standard error may be incomplete: it was still being read {} ms after the app ended)", STDERR_GRACE.as_millis())
+                    };
+                    last = format!("{error}\n--- the app's log ---\n{}{note}", log_tail(&log, 40));
                     if !log_has(&log, "failed to bind") {
                         break;
                     }
@@ -799,6 +832,7 @@ fn summarize(cfg: &Config, scenario: Scenario, obs: &Observations, problems: &[S
 mod tests {
     use std::cell::Cell;
     use std::os::windows::process::CommandExt;
+    use std::sync::atomic::AtomicBool;
 
     use super::*;
 
@@ -837,12 +871,49 @@ mod tests {
         }
     }
 
+    /// A reader of the app's standard error that is slow to hand over the first of it, as one that is not scheduled
+    /// promptly would be.
+    struct Slow<R>(R, Option<Duration>);
+
+    impl<R: Read> Read for Slow<R> {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            if let Some(delay) = self.1.take() {
+                thread::sleep(delay);
+            }
+            self.0.read(buf)
+        }
+    }
+
+    /// A reader that hands over one line and then does not reach the end of the pipe until `release` is set (or 15 s
+    /// have passed, so that a start that waits for it without a limit fails its test instead of hanging), as one
+    /// would if something the app started still held the pipe open.
+    struct Stalls {
+        line: Option<&'static str>,
+        release: Arc<AtomicBool>,
+    }
+
+    impl Read for Stalls {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            if let Some(line) = self.line.take() {
+                buf[..line.len()].copy_from_slice(line.as_bytes());
+                return Ok(line.len());
+            }
+            for _ in 0..1500 {
+                if self.release.load(Ordering::Relaxed) {
+                    break;
+                }
+                thread::sleep(Duration::from_millis(10));
+            }
+            Ok(0)
+        }
+    }
+
     #[test]
     fn a_start_that_fails_keeps_its_settings_folder_and_names_it() {
         let root = Root::new("keeps");
         let token = "0123456789abcdef".repeat(4);
         let starts = Cell::new(0);
-        let error = failed(App::launch_in(&root.0, "fake", (1920, 1080), |start| {
+        let error = failed(App::launch_in(&root.0, "fake", (1920, 1080), capture_stderr, |start| {
             starts.set(starts.get() + 1);
             // What the app writes before it dies: its own log file, and its control token.
             let logs = start.settings.join("logs");
@@ -866,13 +937,52 @@ mod tests {
     fn a_taken_control_port_is_tried_again_and_a_start_that_never_works_is_still_kept() {
         let root = Root::new("port");
         let starts = Cell::new(0);
-        let error = failed(App::launch_in(&root.0, "fake", (1920, 1080), |_| {
+        let error = failed(App::launch_in(&root.0, "fake", (1920, 1080), capture_stderr, |_| {
             starts.set(starts.get() + 1);
             // Reports the port as taken and stays up, as the app does (`ping` is only a way to wait 2 s).
             stand_in("echo photocraft: control server failed to bind 127.0.0.1:1 1>&2 & ping -n 3 127.0.0.1 >nul")
         }));
         assert_eq!(starts.get(), 3, "{error}");
         assert!(error.contains("the control port was taken"), "{error}");
+        let kept = root.kept();
+        assert_eq!(kept.len(), 1, "{kept:?}");
+        assert!(error.contains(&format!("(kept in {})", kept[0].display())), "{error}");
+    }
+
+    #[test]
+    fn the_last_lines_of_a_failed_start_are_in_the_error_even_when_the_reader_is_slow() {
+        let root = Root::new("slow");
+        // The stand-in is gone almost at once; its last words are still in the pipe when the reader is asked for them.
+        let error = failed(App::launch_in(
+            &root.0,
+            "fake",
+            (1920, 1080),
+            |stderr, log| capture_stderr(Slow(stderr, Some(Duration::from_millis(400))), log),
+            |_| stand_in("echo the last words 1>&2 & exit /b 3"),
+        ));
+        assert!(error.contains("exited while starting"), "{error}");
+        assert!(error.contains("the last words"), "{error}");
+        assert!(!error.contains("incomplete"), "the reader finished in time: {error}");
+    }
+
+    #[test]
+    fn a_reader_that_never_finishes_does_not_stall_a_failed_start_and_the_error_says_so() {
+        let root = Root::new("stalled");
+        let release = Arc::new(AtomicBool::new(false));
+        let began = Instant::now();
+        let error = failed(App::launch_in(
+            &root.0,
+            "fake",
+            (1920, 1080),
+            |_, log| capture_stderr(Stalls { line: Some("what the app said first\n"), release: Arc::clone(&release) }, log),
+            |_| stand_in("exit /b 3"),
+        ));
+        let waited = began.elapsed();
+        release.store(true, Ordering::Relaxed);
+        assert!(waited < Duration::from_secs(10), "{waited:?}");
+        assert!(error.contains("exited while starting"), "{error}");
+        assert!(error.contains("what the app said first"), "what was read is kept: {error}");
+        assert!(error.contains("standard error may be incomplete"), "{error}");
         let kept = root.kept();
         assert_eq!(kept.len(), 1, "{kept:?}");
         assert!(error.contains(&format!("(kept in {})", kept[0].display())), "{error}");
